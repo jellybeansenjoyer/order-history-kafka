@@ -1,0 +1,174 @@
+# Order Timeline & Late Consumer Replay
+# Single-node Kafka (KRaft) + checkout simulator + support API + optional fraud scorer
+
+networks:
+  order-timeline-net:
+    driver: bridge
+
+volumes:
+  kafka-data: {}
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    container_name: ot-kafka
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-9092}:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:29093,PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_EXTERNAL_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - order-timeline-net
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: ot-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        TOPIC="$${ORDER_EVENTS_TOPIC:-order-events}"
+        PARTS="$${ORDER_EVENTS_PARTITIONS:-6}"
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic "$$TOPIC" \
+          --partitions "$$PARTS" \
+          --replication-factor 1 \
+          --config retention.ms=604800000 \
+          --config cleanup.policy=delete
+        echo "Topic $$TOPIC ready (partitions=$$PARTS)"
+        kafka-topics --bootstrap-server kafka:9092 --describe --topic "$$TOPIC"
+    environment:
+      ORDER_EVENTS_TOPIC: ${ORDER_EVENTS_TOPIC:-order-events}
+      ORDER_EVENTS_PARTITIONS: ${ORDER_EVENTS_PARTITIONS:-6}
+    networks:
+      - order-timeline-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: ot-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_PORT:-8080}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: order-timeline
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - order-timeline-net
+
+  checkout-simulator:
+    build:
+      context: .
+      dockerfile: checkout-simulator/Dockerfile
+    container_name: ot-checkout-simulator
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "${CHECKOUT_SIMULATOR_PORT:-8101}:8101"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_EVENTS_TOPIC: ${ORDER_EVENTS_TOPIC:-order-events}
+      SIMULATOR_AUTO_START: ${SIMULATOR_AUTO_START:-false}
+      SIMULATOR_INTERVAL_MS: ${SIMULATOR_INTERVAL_MS:-2000}
+      PORT: "8101"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8101/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - order-timeline-net
+
+  support-api:
+    build:
+      context: .
+      dockerfile: support-api/Dockerfile
+    container_name: ot-support-api
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "${SUPPORT_API_PORT:-8102}:8102"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_EVENTS_TOPIC: ${ORDER_EVENTS_TOPIC:-order-events}
+      CONSUMER_GROUP: support-timeline
+      PORT: "8102"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8102/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - order-timeline-net
+
+  fraud-scorer:
+    build:
+      context: .
+      dockerfile: fraud-scorer/Dockerfile
+    container_name: ot-fraud-scorer
+    profiles: ["fraud"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "${FRAUD_SCORER_PORT:-8103}:8103"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_EVENTS_TOPIC: ${ORDER_EVENTS_TOPIC:-order-events}
+      CONSUMER_GROUP: fraud-scorer
+      PORT: "8103"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8103/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - order-timeline-net
+
+  support-ui:
+    build:
+      context: ./support-ui
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPPORT_API_URL: http://localhost:${SUPPORT_API_PORT:-8102}
+        VITE_CHECKOUT_API_URL: http://localhost:${CHECKOUT_SIMULATOR_PORT:-8101}
+        VITE_FRAUD_API_URL: http://localhost:${FRAUD_SCORER_PORT:-8103}
+    container_name: ot-support-ui
+    depends_on:
+      support-api:
+        condition: service_healthy
+    ports:
+      - "${SUPPORT_UI_PORT:-5173}:80"
+    networks:
+      - order-timeline-net
